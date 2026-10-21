@@ -3,7 +3,7 @@
 Run it again every time you change the firmware's web page:   python3 tools/sync_ui.py [path/to/assets.h]"""
 import re, sys, os
 here = os.path.dirname(os.path.abspath(__file__))
-src = sys.argv[1] if len(sys.argv) > 1 else os.path.join(here, '..', '..', 'lora_messenger', 'assets.h')
+src = sys.argv[1] if len(sys.argv) > 1 else os.path.join(here, '..', 'firmware', 'lora_messenger', 'assets.h')
 s = open(src, encoding='utf-8').read()
 m = re.search(r'R"rawliteral\((.*?)\)rawliteral"', s, re.S)
 if not m:

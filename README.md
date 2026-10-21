@@ -12,7 +12,7 @@
 
 ## ۲) برنامه
 1. پوشهٔ `lora_messenger_android` را در **Android Studio** باز کنید (Sync اتوماتیک انجام می‌شود).
-2. هر بار صفحهٔ وب فریمور را عوض کردید: `python3 tools/sync_ui.py` (مسیر پیش‌فرض `../lora_messenger/assets.h`).
+2. هر بار صفحهٔ وب فریمور را عوض کردید: `python3 tools/sync_ui.py` (مسیر پیش‌فرض `firmware/lora_messenger/assets.h`).
 3. Run روی گوشی (Android 8 به بالا) یا Build ← Build APK.
 
 ## استفاده
