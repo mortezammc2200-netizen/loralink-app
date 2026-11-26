@@ -61,7 +61,7 @@ struct GwProxy;
 #define USE_BUTTON  1
 // Bluetooth bridge for the Android app. Set to 1 only after installing the "NimBLE-Arduino" library
 // (and choose a partition scheme with a bigger app, e.g. "Huge APP"). 0 = Wi-Fi only, exactly as before.
-#define USE_BLE_BRIDGE 0
+#define USE_BLE_BRIDGE 1
 #ifndef SOS_BTN_PIN
 #define SOS_BTN_PIN -1     // optional hardware SOS button (GPIO, to GND, hold 3 s). -1 = disabled
 #endif
@@ -2528,11 +2528,13 @@ void setup() {
   server.on("/api/restart", HTTP_POST, G(handleRestart));
   server.on("/api/wipe", HTTP_POST, G(handleWipe));
   featRoutes();
+  Serial.println("Preparing file storage (the first start after changing the partition can take up to a minute)...");
   fileInit();
   fileRoutes();
 #if USE_BLE_BRIDGE
   bleInit();
   server.on("/api/ble", HTTP_GET, G(handleBle));
+  server.on("/api/blepin", HTTP_POST, G(handleBlePin));
 #else
   server.on("/api/ble", HTTP_GET, G([]() { jokx(",\"on\":0"); }));
 #endif

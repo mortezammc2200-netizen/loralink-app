@@ -36,6 +36,7 @@ class MainActivity : AppCompatActivity(), BleLink.Listener {
     private val names = ArrayList<String>()
     private lateinit var adapter: ArrayAdapter<String>
     private val pool = Executors.newFixedThreadPool(2)
+    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
     private var fileCb: ValueCallback<Array<Uri>>? = null
     private val prefs by lazy { getSharedPreferences("loralink", Context.MODE_PRIVATE) }
 
@@ -95,11 +96,11 @@ class MainActivity : AppCompatActivity(), BleLink.Listener {
 
     override fun onState(text: String, connected: Boolean) = runOnUiThread {
         status.text = text
-        if (connected) showWeb()
-        else if (web != null && text == "Disconnected") {
-            Toast.makeText(this, "Bluetooth disconnected", Toast.LENGTH_SHORT).show()
-            root.removeView(web); web?.destroy(); web = null
-            pickerView.visibility = View.VISIBLE
+        if (connected) { showWeb(); web?.evaluateJavascript("window.dispatchEvent(new Event('online'))", null) }
+        else if (web != null) {
+            // keep the page, and try to bring the Bluetooth link back
+            Toast.makeText(this, "Bluetooth: $text - reconnecting...", Toast.LENGTH_SHORT).show()
+            handler.postDelayed({ link.reconnect() }, 2500)
         }
     }
 

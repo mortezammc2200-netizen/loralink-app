@@ -42,6 +42,9 @@ class BleLink(private val ctx: Context) {
     @Volatile private var mtu = 23
     @Volatile var connected = false
         private set
+    @Volatile private var connecting = false
+    private var lastDev: BluetoothDevice? = null
+    private var seq = 0
 
     private val writeDone = Semaphore(0)
     private var readyLatch = CountDownLatch(1)
@@ -70,10 +73,18 @@ class BleLink(private val ctx: Context) {
     fun stopScan() { try { scanner?.stopScan(scanCb) } catch (_: Exception) {} }
 
     // ------------------------------------------------------------ connect (pairs with the PIN the first time)
+    /** Reconnects to the last device (used after the Bluetooth link dropped). */
+    fun reconnect() { val d = lastDev ?: return; if (!connected && !connecting) connect(d) }
+
     fun connect(dev: BluetoothDevice) {
         stopScan()
+        if (connecting) return
+        connecting = true
+        lastDev = dev
         Thread {
             try {
+                try { gatt?.close() } catch (_: Exception) {}
+                gatt = null
                 if (dev.bondState != BluetoothDevice.BOND_BONDED) {
                     listener?.onState("Pairing - type the PIN shown in the device's Settings > Bluetooth", false)
                     if (!bond(dev)) { listener?.onState("Pairing failed or cancelled", false); return@Thread }
@@ -83,9 +94,12 @@ class BleLink(private val ctx: Context) {
                 gatt = if (Build.VERSION.SDK_INT >= 23) dev.connectGatt(ctx, false, gattCb, BluetoothDevice.TRANSPORT_LE)
                        else dev.connectGatt(ctx, false, gattCb)
                 if (!readyLatch.await(25, TimeUnit.SECONDS)) {
-                    listener?.onState("Could not connect", false); disconnect()
+                    try { gatt?.close() } catch (_: Exception) {}
+                    gatt = null
+                    connecting = false
+                    listener?.onState("Could not connect", false)
                 }
-            } catch (e: Exception) { listener?.onState("Error: ${e.message}", false) }
+            } catch (e: Exception) { connecting = false; listener?.onState("Error: ${e.message}", false) }
         }.start()
     }
 
@@ -121,10 +135,13 @@ class BleLink(private val ctx: Context) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 g.requestMtu(247)
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                val was = connected
                 connected = false
+                connecting = false
+                if (!was) readyLatch.countDown()
                 synchronized(inLock) { (inLock as Object).notifyAll() }
                 writeDone.release()
-                listener?.onState("Disconnected", false)
+                listener?.onState(if (was) "Disconnected (code $status)" else "Could not connect (code $status)", false)
                 try { g.close() } catch (_: Exception) {}
             }
         }
@@ -141,6 +158,7 @@ class BleLink(private val ctx: Context) {
         }
         override fun onDescriptorWrite(g: BluetoothGatt, d: BluetoothGattDescriptor, status: Int) {
             connected = true
+            connecting = false
             listener?.onState("Connected", true)
             readyLatch.countDown()
         }
@@ -158,10 +176,13 @@ class BleLink(private val ctx: Context) {
             val rx = rxChar ?: return null
             if (!connected) return null
             synchronized(inLock) { inBuf.reset() }
-            val frame = ByteArray(4 + raw.size)
-            frame[0] = (raw.size and 255).toByte(); frame[1] = ((raw.size shr 8) and 255).toByte()
-            frame[2] = ((raw.size shr 16) and 255).toByte(); frame[3] = ((raw.size shr 24) and 255).toByte()
-            System.arraycopy(raw, 0, frame, 4, raw.size)
+            seq = (seq + 1) and 255
+            val mySeq = seq
+            val frame = ByteArray(5 + raw.size)
+            frame[0] = mySeq.toByte()
+            frame[1] = (raw.size and 255).toByte(); frame[2] = ((raw.size shr 8) and 255).toByte()
+            frame[3] = ((raw.size shr 16) and 255).toByte(); frame[4] = ((raw.size shr 24) and 255).toByte()
+            System.arraycopy(raw, 0, frame, 5, raw.size)
             val chunk = maxOf(20, mtu - 3)
             var off = 0
             writeDone.drainPermits()
@@ -177,11 +198,18 @@ class BleLink(private val ctx: Context) {
             synchronized(inLock) {
                 while (true) {
                     val b = inBuf.toByteArray()
-                    if (b.size >= 4) {
-                        val len = (b[0].toInt() and 255) or ((b[1].toInt() and 255) shl 8) or
-                                ((b[2].toInt() and 255) shl 16) or ((b[3].toInt() and 255) shl 24)
-                        if (len < 0 || len > 2_000_000) return null
-                        if (b.size >= 4 + len) return b.copyOfRange(4, 4 + len)
+                    // look for our answer: [seq][len4][data]; stale bytes of an earlier (timed out) answer are skipped
+                    var i = 0
+                    while (i + 5 <= b.size) {
+                        if ((b[i].toInt() and 255) == mySeq) {
+                            val len = (b[i + 1].toInt() and 255) or ((b[i + 2].toInt() and 255) shl 8) or
+                                    ((b[i + 3].toInt() and 255) shl 16) or ((b[i + 4].toInt() and 255) shl 24)
+                            if (len in 1..2_000_000) {
+                                if (b.size >= i + 5 + len) return b.copyOfRange(i + 5, i + 5 + len)
+                                break
+                            }
+                        }
+                        i++
                     }
                     val left = deadline - System.currentTimeMillis()
                     if (left <= 0 || !connected) return null
