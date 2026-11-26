@@ -43,8 +43,10 @@ class BleLink(private val ctx: Context) {
     @Volatile var connected = false
         private set
     @Volatile private var connecting = false
+    @Volatile var wrongPin = false
     private var lastDev: BluetoothDevice? = null
     private var seq = 0
+    var pin: String = "123456"
 
     private val writeDone = Semaphore(0)
     private var readyLatch = CountDownLatch(1)
@@ -80,15 +82,12 @@ class BleLink(private val ctx: Context) {
         stopScan()
         if (connecting) return
         connecting = true
+        wrongPin = false
         lastDev = dev
         Thread {
             try {
                 try { gatt?.close() } catch (_: Exception) {}
                 gatt = null
-                if (dev.bondState != BluetoothDevice.BOND_BONDED) {
-                    listener?.onState("Pairing - type the PIN shown in the device's Settings > Bluetooth", false)
-                    if (!bond(dev)) { listener?.onState("Pairing failed or cancelled", false); return@Thread }
-                }
                 listener?.onState("Connecting...", false)
                 readyLatch = CountDownLatch(1)
                 gatt = if (Build.VERSION.SDK_INT >= 23) dev.connectGatt(ctx, false, gattCb, BluetoothDevice.TRANSPORT_LE)
@@ -141,7 +140,7 @@ class BleLink(private val ctx: Context) {
                 if (!was) readyLatch.countDown()
                 synchronized(inLock) { (inLock as Object).notifyAll() }
                 writeDone.release()
-                listener?.onState(if (was) "Disconnected (code $status)" else "Could not connect (code $status)", false)
+                if (!wrongPin) listener?.onState(if (was) "Disconnected (code $status)" else "Could not connect (code $status)", false)
                 try { g.close() } catch (_: Exception) {}
             }
         }
@@ -158,9 +157,22 @@ class BleLink(private val ctx: Context) {
         }
         override fun onDescriptorWrite(g: BluetoothGatt, d: BluetoothGattDescriptor, status: Int) {
             connected = true
-            connecting = false
-            listener?.onState("Connected", true)
-            readyLatch.countDown()
+            Thread {
+                // the first frame must be the PIN
+                val a = request(("AUTH " + pin).toByteArray(), 8000)
+                val code = if (a == null) -1 else HttpRaw.parse(a).status
+                connecting = false
+                if (code == 200) {
+                    listener?.onState("Connected", true)
+                    readyLatch.countDown()
+                } else {
+                    val msg = when (code) { 401 -> "Wrong PIN"; 429 -> "Too many wrong PINs - wait a minute"; else -> "No answer from the device" }
+                    listener?.onState(msg, false)
+                    wrongPin = (code == 401 || code == 429)
+                    readyLatch.countDown()
+                    disconnect()
+                }
+            }.start()
         }
         override fun onCharacteristicWrite(g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) { writeDone.release() }
         override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic) {

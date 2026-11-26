@@ -9,7 +9,8 @@
 //    service 6E400001-B5A3-F393-E0A9-E50E24DCCA9E
 //    RX (app -> device, write)   6E400002-...
 //    TX (device -> app, notify)  6E400003-...
-//  Pairing: the link must be encrypted; Android asks for the 6-digit PIN shown in Settings > Bluetooth (admin only).
+//  Security: no OS-level pairing. The first frame of every connection must be  "AUTH <6-digit PIN>"  (PIN: Settings > Bluetooth, default 123456);
+//  until it is accepted every request is refused. 5 wrong PINs lock the link for 60 s.
 //
 //  Needs the library "NimBLE-Arduino" (Library Manager) and  #define USE_BLE_BRIDGE 1  in the main sketch.
 // ===========================================================================
@@ -39,6 +40,9 @@ static volatile bool bleConn = false;
 static volatile uint16_t bleConnHandle = 0;
 static uint32_t blePin = 123456;
 static bool bleReady = false;
+static bool bleAuthed = false;
+static uint8_t bleFails = 0;
+static uint32_t bleLockUntil = 0;
 
 static uint16_t bleCount() { return (uint16_t)((bleHead + BLE_RING - bleTail) % BLE_RING); }
 
@@ -72,7 +76,7 @@ class BleSrvCb : public NimBLEServerCallbacks {
 #endif
     bleConn = true;
     bleHead = bleTail = 0;
-    bleSrv->updateConnParams(bleConnHandle, 24, 48, 0, 400);        // 30-60 ms interval, 4 s supervision timeout: survives Wi-Fi coexistence
+    bleAuthed = false;
   }
 #if BLE_V2
   void onDisconnect(NimBLEServer* s, NimBLEConnInfo& info, int reason) {
@@ -80,6 +84,7 @@ class BleSrvCb : public NimBLEServerCallbacks {
   void onDisconnect(NimBLEServer* s) {
 #endif
     bleConn = false;
+    bleAuthed = false;
     bleHead = bleTail = 0;
     NimBLEDevice::startAdvertising();
   }
@@ -93,15 +98,12 @@ void bleInit() {
   String nm = String("LoRaLink-") + hex8(myUid).substring(4);
   NimBLEDevice::init(nm.c_str());
   NimBLEDevice::setMTU(247);
-  NimBLEDevice::setSecurityAuth(true, true, true);                 // bonding + MITM + secure connections
-  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);
-  NimBLEDevice::setSecurityPasskey(blePin);
   bleSrv = NimBLEDevice::createServer();
   bleSrv->setCallbacks(new BleSrvCb());
   NimBLEService* svc = bleSrv->createService(BLE_SVC_UUID);
-  NimBLECharacteristic* rx = svc->createCharacteristic(BLE_RX_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::WRITE_ENC | NIMBLE_PROPERTY::WRITE_AUTHEN);
+  NimBLECharacteristic* rx = svc->createCharacteristic(BLE_RX_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
   rx->setCallbacks(new BleRxCb());
-  bleTx = svc->createCharacteristic(BLE_TX_UUID, NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC | NIMBLE_PROPERTY::READ_AUTHEN);
+  bleTx = svc->createCharacteristic(BLE_TX_UUID, NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ);
   svc->start();
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   adv->addServiceUUID(BLE_SVC_UUID);
@@ -129,6 +131,14 @@ static void bleSend(const uint8_t* d, size_t n) {
 }
 
 // forwards one raw HTTP request to our own web server and returns the raw answer
+static void bleReply(uint8_t seq, const String& resp) {
+  uint8_t hd[5];
+  uint32_t n = resp.length();
+  hd[0] = seq; hd[1] = n & 255; hd[2] = (n >> 8) & 255; hd[3] = (n >> 16) & 255; hd[4] = (n >> 24) & 255;
+  bleSend(hd, 5);
+  bleSend((const uint8_t*)resp.c_str(), n);
+}
+
 static void bleForward(uint8_t seq, const uint8_t* req, size_t rl) {
   WiFiClient cl;
   String resp;
@@ -156,11 +166,7 @@ static void bleForward(uint8_t seq, const uint8_t* req, size_t rl) {
   }
   Serial.printf("BLE answer %u bytes\n", (unsigned)resp.length());
   if (!resp.length()) resp = "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-  uint8_t hd[5];
-  uint32_t n = resp.length();
-  hd[0] = seq; hd[1] = n & 255; hd[2] = (n >> 8) & 255; hd[3] = (n >> 16) & 255; hd[4] = (n >> 24) & 255;
-  bleSend(hd, 5);
-  bleSend((const uint8_t*)resp.c_str(), n);
+  bleReply(seq, resp);
 }
 
 void bleService() {
@@ -177,7 +183,24 @@ void bleService() {
   if (!buf) { bleTail = bleHead; return; }
   for (uint32_t i = 0; i < len; i++) buf[i] = bleRing[(bleTail + 5 + i) % BLE_RING];
   bleTail = (uint16_t)((bleTail + 5 + len) % BLE_RING);
-  bleForward(h[0], buf, len);
+  if (!bleAuthed) {
+    String t;
+    for (uint32_t i = 0; i < len && i < 16; i++) t += (char)buf[i];
+    String ok = String("AUTH ") + String((unsigned)blePin);
+    if ((int32_t)(millis() - bleLockUntil) < 0) {
+      bleReply(h[0], "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    } else if (t == ok) {
+      bleAuthed = true; bleFails = 0;
+      Serial.println("BLE phone authenticated");
+      bleReply(h[0], "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK");
+    } else {
+      if (++bleFails >= 5) { bleFails = 0; bleLockUntil = millis() + 60000UL; }
+      Serial.println("BLE wrong PIN");
+      bleReply(h[0], "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    }
+  } else {
+    bleForward(h[0], buf, len);
+  }
   free(buf);
 }
 

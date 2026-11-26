@@ -31,6 +31,7 @@ class MainActivity : AppCompatActivity(), BleLink.Listener {
     private lateinit var status: TextView
     private lateinit var list: ListView
     private lateinit var slugBox: EditText
+    private lateinit var pinBox: EditText
     private var web: WebView? = null
     private val found = ArrayList<BluetoothDevice>()
     private val names = ArrayList<String>()
@@ -65,6 +66,12 @@ class MainActivity : AppCompatActivity(), BleLink.Listener {
             setText(prefs.getString("slug", ""))
             setSingleLine(true)
         }
+        pinBox = EditText(this).apply {
+            hint = "Bluetooth PIN (default 123456)"
+            setText(prefs.getString("pin", "123456"))
+            setSingleLine(true)
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+        }
         val scan = Button(this).apply { text = "Scan"; setOnClickListener { askPermissionsAndScan() } }
         adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, names)
         list = ListView(this).apply {
@@ -72,10 +79,12 @@ class MainActivity : AppCompatActivity(), BleLink.Listener {
             setOnItemClickListener { _, _, i, _ ->
                 prefs.edit().putString("slug", slugBox.text.toString().trim().trim('/')).apply()
                 prefs.edit().putString("last", found[i].address).apply()
+                prefs.edit().putString("pin", pinBox.text.toString().trim()).apply()
+                link.pin = pinBox.text.toString().trim()
                 link.connect(found[i])
             }
         }
-        pickerView.addView(title); pickerView.addView(status); pickerView.addView(slugBox); pickerView.addView(scan)
+        pickerView.addView(title); pickerView.addView(status); pickerView.addView(slugBox); pickerView.addView(pinBox); pickerView.addView(scan)
         pickerView.addView(list, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         root.addView(pickerView)
     }
@@ -97,7 +106,7 @@ class MainActivity : AppCompatActivity(), BleLink.Listener {
     override fun onState(text: String, connected: Boolean) = runOnUiThread {
         status.text = text
         if (connected) { showWeb(); web?.evaluateJavascript("window.dispatchEvent(new Event('online'))", null) }
-        else if (web != null) {
+        else if (web != null && !link.wrongPin) {
             // keep the page, and try to bring the Bluetooth link back
             Toast.makeText(this, "Bluetooth: $text - reconnecting...", Toast.LENGTH_SHORT).show()
             handler.postDelayed({ link.reconnect() }, 2500)
